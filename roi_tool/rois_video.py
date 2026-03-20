@@ -1,5 +1,5 @@
 # File IO
-import sys, glob, os, csv
+import sys, os, csv
 from pathlib import Path
 
 # Vector operations
@@ -62,9 +62,9 @@ class ROIData:
 @dataclass(frozen=True)
 class ImageService:
     """Handles loading and calibrating thermal image data."""
-    calibration_coefficients: NDArray
+    calcoeff: np.ndarray
 
-    def load(self, path: str) -> tuple[NDArray, NDArray]:
+    def load(self, path: str) -> tuple[np.ndarray, np.ndarray]:
         """
         Reads an RJPEG image and applies radiometric calibration.
 
@@ -72,7 +72,7 @@ class ImageService:
             path (str): The file path to the RJPEG image.
 
         Returns:
-            tuple[NDArray, NDArray]: A tuple containing:
+            tuple[np.ndarray, np.ndarray]: A tuple containing:
                 - dc_img: The raw digital counts image array.
                 - rad_img: The radiometrically calibrated image array.
 
@@ -85,13 +85,13 @@ class ImageService:
         dc = rjpeg.raw_counts
         
         # Apply thermal calibration (slope + offset) to raw counts
-        rad = dc * self.calibration_coefficients[:, :, 0] + self.calibration_coefficients[:, :, 1]
+        rad = dc * self.calcoeff[:, :, 0] + self.calcoeff[:, :, 1]
         
         return dc, rad
 
 
 @dataclass(frozen=True)
-class RegistrationService:
+class RegistrationServiceOld:
     """Manages spatial alignment and coordinate transformations between video frames."""
     registered_to: NDArray # variables loaded from
     matrices: NDArray      # Joe's 'register_video.py' script
@@ -106,7 +106,7 @@ class RegistrationService:
             image_shape (tuple): The dimensions of the image (height, width, channels).
 
         Returns:
-            NDArray | None: A 3x3 affine transformation matrix, or None if the frames 
+            np.ndarray | None: A 3x3 affine transformation matrix, or None if the frames 
             do not share a common registration anchor.
         """
         if from_idx == to_idx:
@@ -123,10 +123,12 @@ class RegistrationService:
         # Combine matrices to bridge the two frames
         m_combined = np.linalg.inv(m_to) @ m_from
         
+        print(f"m_combined det: {np.linalg.det(m_combined)}")
+        
         # Shift origin to center of image for correct scale/rotation
         return self._apply_centered(m_combined, image_shape)
     
-    def _get_transform_to_ref(self, start_idx: int) -> tuple[NDArray, int]:
+    def _get_transform_to_ref(self, start_idx: int) -> tuple[np.ndarray, int]:
         """
         Traces a frame's registration path back to its refernce frame.
 
@@ -134,7 +136,7 @@ class RegistrationService:
             start_idx (int): The frame index to trace.
 
         Returns:
-            tuple[NDArray, int]: The accumulated 3x3 transformation matrix and the root frame index.
+            tuple[np.ndarray, int]: The accumulated 3x3 transformation matrix and the root frame index.
         """
         m_total = np.eye(3)
         current = start_idx
@@ -156,11 +158,11 @@ class RegistrationService:
         Shifts the transformation origin to the image center to preserve rotation/scaling accuracy.
 
         Args:
-            transform_matrix (NDArray): The original 3x3 transformation matrix.
+            transform_matrix (np.ndarray): The original 3x3 transformation matrix.
             shape (tuple): The dimensions of the image.
 
         Returns:
-            NDArray: The center-adjusted 3x3 transformation matrix.
+            np.ndarray: The center-adjusted 3x3 transformation matrix.
         """
         # Rotate around the center of the image
         h, w = image_shape[:2]
@@ -180,21 +182,121 @@ class RegistrationService:
 
         return t_back @ transform_matrix @ t_to_origin
 
+@dataclass(frozen=True)
+class RegistrationService:
+    """Manages spatial alignment and coordinate transformations between video frames."""
+    registered_to: NDArray
+    matrices: NDArray
+
+    def transformation(self, from_idx: int, to_idx: int) -> NDArray|None:
+        """
+        Calculates the spatial transformation matrix needed to map coordinates from one frame to another.
+        """
+        if from_idx == to_idx:
+            return np.eye(3)
+
+        # Resolve paths to a common anchor frame
+        m_from, root_from = self._get_transform_to_ref(from_idx)
+        m_to, root_to = self._get_transform_to_ref(to_idx)
+
+        # Disjointed frames cannot be spatially linked
+        if root_from != root_to:
+            return None
+
+        # Combine matrices to bridge the two frames
+        # m_from maps root -> from_idx. So inv(m_from) maps from_idx -> root.
+        # m_to maps root -> to_idx.
+        # Combined maps from_idx -> root -> to_idx.
+        m_combined = m_to @ np.linalg.inv(m_from)
+
+        return m_combined
+
+    def _get_transform_to_ref(self, start_idx: int) -> tuple[np.ndarray, int]:
+        """
+        Traces a frame's registration path back to its reference frame.
+        """
+        m_total = np.eye(3)
+        current = start_idx
+        visited = set()
+
+        while True:
+            # Cycle detection
+            if current in visited:
+                print(f"Warning: Cyclic registration detected at frame {current}. Breaking loop.")
+                break
+            visited.add(current)
+
+            next_idx = self.registered_to[current]
+
+            # Stop condition: Frame is its own anchor or unanchored
+            if next_idx == current or next_idx is None:
+                break
+
+            # Post-multiply since the new matrices map reference -> current
+            m_total = m_total @ self.matrices[current]
+            current = next_idx
+
+        return m_total, current
 
 @dataclass(frozen=True)
 class ROITransformService:
     """Handles the geometric manipulation and extraction of Region of Interest (ROI) data."""
+
+    def transform(self, roi: pg.PolyLineROI, transform_matrix: np.ndarray) -> np.ndarray:
+        """
+        Applies an affine transformation to the boundary points of an ROI.
+        """
+        # Extract local coordinates and map to parent scene
+        points = []
+        for handle in roi.getHandles():
+            pos = roi.mapToParent(handle.pos())
+            # NEW WAY: ORB matrices use [x, y, 1], NOT [y, x, 1]
+            points.append([pos.x(), pos.y(), 1.0])
+
+        # Apply spatial transformation
+        points = np.array(points).T
+        transformed = transform_matrix @ points
+
+        # Normalize homogenous coordinates and format as (x,y) pairs
+        coords = transformed[:2] / transformed[2]
+
+        # We no longer need to reverse the columns with [:, [1, 0]]
+        return coords.T
+
+    def extract_transform_data(self, roi: pg.PolyLineROI, transform_matrix: np.ndarray) -> dict:
+        """
+        Extracts boundary and metadata from an ROI after transformation.
+
+        Args:
+            roi (pg.PolyLineROI): The graphical ROI to process.
+            transform_matrix (np.ndarray): The 3x3 transformation matrix.
+
+        Returns:
+            dict: A lightweight representation containing "points" (np.ndarray) and "metadata" (ROIData).
+        """
+        new_coords = self.transform(roi, transform_matrix)
+        
+        fresh_metadata = replace(roi.metadata, mean=None, stdev=None, mean_display=None, stdev_display=None)
+        
+        return {
+            "points": new_coords,
+            "metadata": fresh_metadata
+        }
+
+@dataclass(frozen=True)
+class ROITransformServiceOld:
+    """Handles the geometric manipulation and extraction of Region of Interest (ROI) data."""
     
-    def transform(self, roi: pg.PolyLineROI, transform_matrix: NDArray) -> NDArray:
+    def transform(self, roi: pg.PolyLineROI, transform_matrix: np.ndarray) -> np.ndarray:
         """
         Applies an affine transformation to the boundary points of an ROI.
 
         Args:
             roi (pg.PolyLineROI): The graphical ROI object to transform.
-            transform_matrix (NDArray): The 3x3 transformation matrix to apply.
+            transform_matrix (np.ndarray): The 3x3 transformation matrix to apply.
 
         Returns:
-            NDArray: An Nx2 array of the newly transformed (X, Y) coordinates.
+            np.ndarray: An Nx2 array of the newly transformed (X, Y) coordinates.
         """
         # Extract local coordinates and map to parent scene
         points = []
@@ -210,16 +312,16 @@ class ROITransformService:
         coords = transformed[:2] / transformed[2]
         return coords.T[:, [1, 0]]
     
-    def extract_transform_data(self, roi: pg.PolyLineROI, transform_matrix: NDArray) -> dict:
+    def extract_transform_data(self, roi: pg.PolyLineROI, transform_matrix: np.ndarray) -> dict:
         """
         Extracts boundary and metadata from an ROI after transformation.
 
         Args:
             roi (pg.PolyLineROI): The graphical ROI to process.
-            transform_matrix (NDArray): The 3x3 transformation matrix.
+            transform_matrix (np.ndarray): The 3x3 transformation matrix.
 
         Returns:
-            dict: A lightweight representation containing "points" (NDArray) and "metadata" (ROIData).
+            dict: A lightweight representation containing "points" (np.ndarray) and "metadata" (ROIData).
         """
         new_coords = self.transform(roi, transform_matrix)
         
@@ -241,7 +343,7 @@ class ROIStatsService:
 
         Args:
             roi (pg.PolyLineROI): The region of interest.
-            image (NDArray): The underlying 2D image data.
+            image (np.ndarray): The underlying 2D image data.
             image_item (pg.ImageItem, optional): The PyQtGraph ImageItem for mapping context.
 
         Returns:
@@ -255,6 +357,8 @@ class ROIStatsService:
         region = roi.getArrayRegion(image, image_item, axes=(1, 0))
         
         mask = roi.getArrayRegion(np.ones_like(image, dtype=np.uint8), image_item, axes=(1, 0))
+        
+        # print(f"Mask size: {mask.shape}")
 
         # Filter pixels fully enclosed by the ROI
         valid = mask > 0
@@ -267,9 +371,6 @@ class ROIStatsService:
 
 @dataclass(frozen=True)
 class ExportService:
-    """
-    Saves ROI metadata and location in a pickle (.pkl) file, and the metadata into a human-readable CSV.
-    """
     save_file: str
     savedir: str
 
@@ -338,8 +439,6 @@ class ExportService:
 # GUI Classes
 # -------------------------------
 class LabeledPolyLineROI(pg.PolyLineROI):
-    """PolyLineROI (or "ROI" as referred to in code), labeled with a unique ID number"""
-    
     def __init__(
         self,
         positions,
@@ -427,37 +526,23 @@ class LabeledPolyLineROI(pg.PolyLineROI):
 
 
 class ImageViewer(QMainWindow):
-    """
-    Main execution script to administrate over the ROIs' display, statistics calculations, calibration, and propagation.
-    
-    Bit of a cluster duck, but I'm not being paid to fix it.
-    """
-    
     def __init__(
         self,
-        data_dir,
         save_dir,
-        metadata_path,
         registration_path,
         calibration_coefficients_path,
-        start_frame,
-        end_frame,
     ):
         super().__init__()
 
-        self.datadir = data_dir
         self.savedir = save_dir
-        self.metadatapath = metadata_path
         self.registrationpath = registration_path
         self.calibration_coefficients_path = calibration_coefficients_path
-        self.start_frame = start_frame
-        self.end_frame = end_frame
 
         # Load data
         self.load_all_data()
 
         # Sets of functions ("Services") 
-        self.image_service = ImageService(self.calibration_coefficients)
+        self.image_service = ImageService(self.calcoeff)
         self.registration = RegistrationService(
             registered_to=self.registered_to,
             matrices=self.transform_matrices,
@@ -473,7 +558,6 @@ class ImageViewer(QMainWindow):
         self.update_frame(self.current_index)
         self._auto_scale_histogram(self.current_img_dc)
         
-
 
     # --------------------------------------------------------
     # (Private) UI Display Helpers
@@ -516,7 +600,7 @@ class ImageViewer(QMainWindow):
 
         # Update PyQt window header information
         self.label.setText(
-            f"Is Reference: {index in self.reference_frames}, "
+            f"Is Reference: {index in self.reference_frames}, Registered To Frame #{self.registered_to[index]}, "
             f"File: {os.path.basename(path)}"
         )
 
@@ -533,14 +617,14 @@ class ImageViewer(QMainWindow):
         if ref_idx not in self.roi_data:
             return
 
-        M = self.registration.transformation(ref_idx, index, self.current_img.shape)
+        M = self.registration.transformation(ref_idx, index)
 
         if M is None:
             return
 
         new_rois = []
         for roi in self.roi_data[ref_idx]:
-            new_roi = self.transform_service.clone_with_transform(roi, M)
+            new_roi = self.transform_service.extract_transform_data(roi, M)
             new_rois.append(new_roi)
 
         self.roi_data[index] = new_rois
@@ -648,7 +732,7 @@ class ImageViewer(QMainWindow):
     # (Private) ROI Helpers
     # --------------------------------------------------------
 
-    def _create_default_roi(self) -> LabeledPolyLineROI:
+    def _create_default_roi(self):
         """Create a default square ROI with new ID. Placed the ROI in top left."""
 
         points = [
@@ -666,11 +750,11 @@ class ImageViewer(QMainWindow):
 
         return roi
 
-    def _register_new_roi(self, roi:pg.PolyLineROI) -> None:
+    def _register_new_roi(self, roi:pg.PolyLineROI):
         """Store ROI in internal data structure."""
         self.roi_data.setdefault(self.current_index, []).append(roi)
 
-    def _attach_roi_to_view(self, roi:pg.PolyLineROI) -> None:
+    def _attach_roi_to_view(self, roi:pg.PolyLineROI):
         """Add ROI to view and connect change handler."""
 
         roi.addToView(self.view_lwir)
@@ -693,11 +777,8 @@ class ImageViewer(QMainWindow):
 
         # Proceed if the user clicked Yes
         if reply == QMessageBox.StandardButton.Yes:
-            # Run the optimized math loop
-            self._update_all_roi_statistics()
-            
-            # Save the data to CSV
-            self.export_service.export_csv(self.roi_data) 
+            # Update ROIs, save stats to CSV, save ROIs to pickle
+            self._save_stats_and_rois()
             
             # Show completion dialog
             QMessageBox.information(
@@ -706,43 +787,59 @@ class ImageViewer(QMainWindow):
                 "Successfully computed and saved ROI statistics"
             )
 
-    def _update_all_roi_statistics(self) -> None:
-        """Recompute calibrated statistics for all frames"""
+    def _update_all_roi_statistics(self):
+        """Recompute calibrated statistics for all ROIs on all frames"""
+        
+        # Create a single reusable temporary ROI
+        temp_roi = None
         
         for frame_idx, rois in self.roi_data.items():
-            
-            # Skip RJPEG image if frame has no ROIs to check
             if not rois:
                 continue
 
-            # Use ImageService to load images from paths
             path = self.files[frame_idx]
             _, img = self.image_service.load(path)
 
-            # Compute mean and std for all ROIs 
             for roi_item in rois:
                 is_dict = isinstance(roi_item, dict)
-                
-                if is_dict:
-                    # Temporarily convert to widget 
-                    roi = LabeledPolyLineROI(roi_item["points"], roi_item["metadata"].id, closed=True)
-                    roi.metadata = roi_item["metadata"]
-                    roi.addToView(self.view_lwir) 
-                else:
-                    roi = roi_item
-
-                mean, std = self.stats_service.compute_stats(roi, img, self.view_lwir.imageItem)
 
                 if is_dict:
+                    # Reuse temp_roi
+                    if temp_roi is None:
+                        temp_roi = LabeledPolyLineROI([], 0, closed=True)
+                    
+                    # Update points in-place
+                    temp_roi.setPoints(roi_item["points"])
+                    temp_roi.metadata = roi_item["metadata"]
+                    
+                    # Add to view once per ROI batch 
+                    if temp_roi.scene() is None:
+                        temp_roi.addToView(self.view_lwir)
+                    
+                    mean, std = self.stats_service.compute_stats(temp_roi, img, self.view_lwir.imageItem)
+                    
                     roi_item["metadata"].mean = mean
                     roi_item["metadata"].stdev = std
-                    # Remove the temporary widget to save memory
-                    roi.removeFromView(self.view_lwir) 
                 else:
-                    roi.metadata.mean = mean
-                    roi.metadata.stdev = std
+                    # For GUI widgets: minimize view operations
+                    was_in_view = roi_item.scene() is not None
+                    
+                    if not was_in_view:
+                        roi_item.addToView(self.view_lwir)
+                    
+                    mean, std = self.stats_service.compute_stats(roi_item, img, self.view_lwir.imageItem)
+                    
+                    if not was_in_view:
+                        roi_item.removeFromView(self.view_lwir)
+                    
+                    roi_item.metadata.mean = mean
+                    roi_item.metadata.stdev = std
+        
+        # Clean up temporary ROI after all stats are computed
+        if temp_roi is not None and temp_roi.scene() is not None:
+            temp_roi.removeFromView(self.view_lwir)
 
-    def _toggle_stats(self) -> None:
+    def _toggle_stats(self):
         """
         Toggles display between DC and Calibrated values and refreshes labels.
         """
@@ -836,7 +933,7 @@ class ImageViewer(QMainWindow):
 
             # Transformation matrix to register
             M = self.registration.transformation(
-                source_idx, target_idx, self.current_img.shape
+                source_idx, target_idx # , self.current_img.shape
             )
 
             if M is None: continue
@@ -851,7 +948,7 @@ class ImageViewer(QMainWindow):
 
         return propagated_count
 
-    def _show_propagation_result(self, count: int) -> None:
+    def _show_propagation_result(self, count: int):
         """Display propogation success to user in GUI"""
         QMessageBox.information(
             self,
@@ -863,52 +960,31 @@ class ImageViewer(QMainWindow):
     # (Private) Data Loading Helpers
     # --------------------------------------------------------
 
-    def _load_files(self) -> None:
-        """Discover RJPEG files and apply frame slicing and altitude sorting"""
-        
-        # Use glob to find all .jpg files in given direectory
-        files = sorted(glob.glob(os.path.join(self.datadir, "*.jpg")))
-
-        # Return error if no files were found
-        if not files:
-            raise RuntimeError(f"No RJPEG (.jpg) files found in {self.datadir}")
-
-        # Crop flight video to desired region
-        if self.end_frame is not None:
-            files = files[self.start_frame : self.end_frame + 1]
-        else:
-            files = files[self.start_frame :]
-
-        if not files:
-            raise RuntimeError("Frame range selection produced no files.")
-
-        # Sort files using the altitude indices from flight_metadata
-        self.files = [files[i] for i in self.sort_idxs]
-
     def _load_calibration(self) -> None:
         """Load calibration coefficients from NumPy file"""
 
         if not Path(self.calibration_coefficients_path).exists():
             raise FileNotFoundError(f"Calibration file not found: {self.calibration_coefficients_path}")
 
-        self.calibration_coefficients = np.load(self.calibration_coefficients_path)
+        self.calcoeff = np.load(self.calibration_coefficients_path)
 
-        if self.calibration_coefficients.ndim != 3 or self.calibration_coefficients.shape[2] != 2:
+        if self.calcoeff.ndim != 3 or self.calcoeff.shape[2] != 2:
             raise ValueError("Calibration array must have shape (H, W, 2)")
 
     def _load_registration(self) -> None:
-        """Load frame registration metadata"""
+        """Load frame registration metadata, file paths, and flight metadata"""
         
         if not os.path.exists(self.registrationpath):
             raise FileNotFoundError(f"Registration file not found: {self.registrationpath}")
 
-        # Load Joe's magical registration logic 
+        # Load Joe's magical registration logic (now with files and metadata included)
         registration_file = np.load(self.registrationpath)
 
-        # Load transformation matrices (M) and paths? ("registered_to")
         try:
             self.registered_to = registration_file["registered_to"]
             self.transform_matrices = registration_file["transform_matrices"]
+            self.files = registration_file["files"]
+            self.metadata = registration_file["metadata"]
         except KeyError as e:
             raise KeyError(f"Missing registration key: {e}")
 
@@ -952,7 +1028,7 @@ class ImageViewer(QMainWindow):
         """Initialize non-persistent runtime variables."""
 
         # Default parameters
-        self.current_index = 0
+        self.current_index = self.registered_to[0]
         self.current_img = None
         self.current_img_dc = None
         self.current_img_rad = None
@@ -970,29 +1046,22 @@ class ImageViewer(QMainWindow):
         # Increment ID
         self.next_roi_id = max_id + 1
 
-    def _load_flight_metadata(self) -> None:
-        """Load flight metadata and prepare sorting indices based on absolute altitude"""
+    def _save_stats_and_rois(self) -> None:
+        """Saving ROI data and statistics."""
         
-        # Load metadata file
-        metadata = np.load(self.metadatapath)
-        
-        # Crop flight video to desired region
-        if self.end_frame is not None:
-            metadata = metadata[self.start_frame : self.end_frame + 1]
-        else:
-            metadata = metadata[self.start_frame :]
-            
-        # Extract altitude from metadata
-        altitude_abs = metadata[:, 0]
-        
-        # Sort altitude in descending order (litearlly)
-        self.sort_idxs = (-altitude_abs).argsort()
-        self.metadata = metadata[self.sort_idxs]
+        # Update the statistics that'll be saved
+        self._update_all_roi_statistics()
 
+        # Save ROI data to pickle
+        self.export_service.save_pickle(self.roi_data, len(self.files))
+        
+        # Save stats to CSV
+        self.export_service.export_csv(self.roi_data)
+        
     # ----------------
     # Main executables
     # ----------------
-    def update_frame(self, index: int) -> None:
+    def update_frame(self, index: int):
         """Updated frame after the user interfaces with GUI"""
 
         # Hide previous ROIs when going through video
@@ -1005,7 +1074,8 @@ class ImageViewer(QMainWindow):
         self._display_current_image()
         self._show_rois_for_frame(index)
         
-    def propagate_rois(self) -> None:
+
+    def propagate_rois(self):
         """ROI propagation pipeline"""
 
         # Check if propogation is possible
@@ -1025,41 +1095,25 @@ class ImageViewer(QMainWindow):
         # Refresh current frame display
         self.update_frame(self.current_index)
 
-    def add_roi(self) -> None:
+    def add_roi(self):
         """Create a default ROI in top-left corner (Joe's default)"""
         roi = self._create_default_roi()
         self._register_new_roi(roi)
         self._attach_roi_to_view(roi)
         self._update_roi_display(roi)
 
-    def save_stats(self) -> None:
-        """Saving ROI data and statistics."""
-        
-        # Update the statistics that'll be saved
-        self._update_all_roi_statistics()
-
-        # Save ROI data to pickle
-        self.export_service.save_pickle(self.roi_data, len(self.files))
-        
-        # Save stats to CSV
-        self.export_service.export_csv(self.roi_data)
-
-    def load_all_data(self) -> None:
+    def load_all_data(self):
         """Data-loading pipeline."""
-        # Flight metadata
-        self._load_flight_metadata()
-        # RJPEG files
-        self._load_files()
+        # Registration, metadata, and files loading
+        self._load_registration()
         # Calibration coefficients
         self._load_calibration()
-        # Joe's Image registration magic
-        self._load_registration()
         # Metadata of each ROI
         self._load_roi_metadata()
         # Get the GUI started
         self._initialize_runtime_state()
 
-    def build_ui(self) -> None:
+    def build_ui(self):
         """Construct all Qt widgets, layouts, and signal connections."""
 
         # Set PyQt GUI window title
@@ -1090,6 +1144,7 @@ class ImageViewer(QMainWindow):
         # ========================
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, len(self.files) - 1)
+        self.slider.setValue(self.current_index)
         self.slider.valueChanged.connect(self.update_frame)
         main_layout.addWidget(self.slider)
 
@@ -1143,7 +1198,7 @@ class ImageViewer(QMainWindow):
         # Inject the action into the context menu
         view_box.menu.addAction(self.propagate_action)
 
-    def add_view_roi(self) -> None:
+    def add_view_roi(self):
         """
         Creates a new ROI that covers the central 1/4 of the current view area
         """
@@ -1153,8 +1208,6 @@ class ImageViewer(QMainWindow):
         
         # Calculate center and offset 
         center = rect.center()
-        center_x = center.x()
-        center_y = center.y()
         w_quarter = rect.width() / 4
         h_quarter = rect.height() / 4
         w_offset = w_quarter / 2
@@ -1162,10 +1215,10 @@ class ImageViewer(QMainWindow):
         
         # Define 4 points centered on current view
         points = [
-            [center_x - w_offset, center_y - h_offset],
-            [center_x - w_offset, center_y + h_offset],
-            [center_x + w_offset, center_y + h_offset],
-            [center_x + w_offset, center_y - h_offset],
+            [center.x() - w_offset, center.y() - h_offset],
+            [center.x() - w_offset, center.y() + h_offset],
+            [center.x() + w_offset, center.y() + h_offset],
+            [center.x() + w_offset, center.y() - h_offset],
         ]
 
         # Define ROI, and add metadata to it
@@ -1179,39 +1232,25 @@ class ImageViewer(QMainWindow):
         self._update_roi_display(roi)
 
 
-
-# --------------------------------------------------------------
-# Main Execution ; gets called by the Jupyter Notebook
-# --------------------------------------------------------------
+# -------------------------------
+# Main Execution
+# -------------------------------
 if __name__ == "__main__":
-    
     # Argument parsing
     args = sys.argv[1:]
-    assert len(args) == 7
+    assert len(args) == 3, "Usage: python rois_video.py <save_dir> <registration_path> <calibration_coefficients_path>"
     (
-        data_dir,
         save_dir,
-        metadata_path,
         registration_path,
         calibration_coefficients_path,
-        start_frame,
-        end_frame,
     ) = args
-    
-    # Storing arguments into variables
-    start_frame = int(start_frame)
-    end_frame = int(end_frame)
     
     # Start GUI application
     app = QApplication(sys.argv)
     window = ImageViewer(
-        data_dir,
         save_dir,
-        metadata_path,
         registration_path,
         calibration_coefficients_path,
-        start_frame,
-        end_frame,
     )
     window.show()
     
